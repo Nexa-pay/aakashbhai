@@ -41,6 +41,7 @@ application = None
 shutdown_event = asyncio.Event()
 lock_file = None
 lock_file_path = '/tmp/bot.lock'
+loop = None
 
 def acquire_lock():
     """Acquire a lock file to prevent multiple instances"""
@@ -1137,13 +1138,6 @@ async def async_main():
         
         # Create application with custom settings to avoid conflicts
         builder = Application.builder().token(BOT_TOKEN)
-        
-        # Add custom connection settings
-        builder.connect_timeout(30)
-        builder.read_timeout(30)
-        builder.write_timeout(30)
-        builder.pool_timeout(30)
-        
         application = builder.build()
         
         # Add handlers
@@ -1160,11 +1154,10 @@ async def async_main():
         await application.initialize()
         await application.start()
         
-        # Start polling with custom settings - FIXED conflict issue
+        # Start polling with standard parameters - FIXED: removed invalid parameter
         await application.updater.start_polling(
             poll_interval=1.0,
             timeout=30,
-            read_latency=2.0,
             bootstrap_retries=5,
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True  # This clears any stuck updates
@@ -1183,7 +1176,7 @@ async def async_main():
         # Stop application
         if application:
             try:
-                if application.updater:
+                if application.updater and application.updater.running:
                     await application.updater.stop()
                 await application.stop()
                 await application.shutdown()
