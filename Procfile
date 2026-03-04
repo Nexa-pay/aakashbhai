@@ -1,1 +1,1 @@
-gf
+web: python main.py
