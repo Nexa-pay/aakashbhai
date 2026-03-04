@@ -46,7 +46,7 @@ class Database:
                 # Create tables
                 Base.metadata.create_all(self.engine)
                 
-                # Create session factory
+                # Create session factory with scoped_session for thread safety
                 session_factory = sessionmaker(bind=self.engine)
                 self.Session = scoped_session(session_factory)
                 
