@@ -1,4 +1,6 @@
 import logging
+import asyncio
+import sys
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
@@ -18,7 +20,6 @@ from utils import (
     stats,
     get_utc_now
 )
-import asyncio
 from datetime import datetime, timezone
 
 # Enable logging
@@ -28,35 +29,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize components
+# Initialize components as global variables
 db = None
 account_manager = None
 reporter = None
+application = None
 
-async def startup():
-    """Initialize components on startup"""
-    global db, account_manager, reporter
-    from config import DATABASE_URL
+async def async_main():
+    """Async main function"""
+    global db, account_manager, reporter, application
     
-    # Initialize database
-    db = init_db(DATABASE_URL)
-    
-    # Initialize account manager
-    account_manager = AccountManager()
-    await account_manager.start()
-    
-    # Initialize reporter
-    reporter = Reporter(account_manager)
-    
-    logger.info("✅ All components initialized")
+    try:
+        # Initialize database
+        from config import DATABASE_URL
+        db = init_db(DATABASE_URL)
+        logger.info("✅ Database initialized")
+        
+        # Initialize account manager
+        account_manager = AccountManager()
+        await account_manager.start()
+        logger.info("✅ Account manager started")
+        
+        # Initialize reporter
+        reporter = Reporter(account_manager)
+        logger.info("✅ Reporter initialized")
+        
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CallbackQueryHandler(button_handler))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_error_handler(error_handler)
+        
+        logger.info("🤖 Bot started successfully!")
+        logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
+        logger.info(f"Owner ID: {OWNER_ID}")
+        
+        # Start polling (this blocks until stopped)
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
+    finally:
+        # Cleanup
+        if account_manager:
+            await account_manager.stop()
+        if db:
+            db.close_session()
+        logger.info("✅ Shutdown complete")
 
-async def shutdown():
-    """Cleanup on shutdown"""
-    if account_manager:
-        await account_manager.stop()
-    if db:
-        db.close_session()
-    logger.info("✅ Shutdown complete")
+def main():
+    """Synchronous main entry point"""
+    try:
+        # Create and set event loop
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the async main function
+        loop.run_until_complete(async_main())
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+    finally:
+        # Clean up loop
+        try:
+            loop.stop()
+            loop.close()
+        except:
+            pass
 
 # ==================== COMMAND HANDLERS ====================
 
@@ -92,7 +140,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db_session.close()
     
-    # Create main menu
+    # Create menu
     keyboard = [
         [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
         [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
@@ -264,6 +312,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⛔ Access Denied!")
             return
         await show_owner_stats(query)
+    
+    elif query.data == 'owner_add_tokens':
+        if db_user.role != 'owner':
+            await query.edit_message_text("⛔ Access Denied!")
+            return
+        await query.edit_message_text(
+            "💰 **Add Tokens to User**\n\n"
+            "Please send the user ID and amount in this format:\n"
+            "`USER_ID AMOUNT`\n\n"
+            "Example: `123456789 1000`"
+        )
+        context.user_data['awaiting_owner_token_add'] = True
+    
+    elif query.data == 'owner_add_admin':
+        if db_user.role != 'owner':
+            await query.edit_message_text("⛔ Access Denied!")
+            return
+        await query.edit_message_text(
+            "👑 **Add Admin**\n\n"
+            "Please send the user ID to make admin:\n"
+            "Example: `123456789`"
+        )
+        context.user_data['awaiting_admin_add'] = True
     
     elif query.data == 'confirm_report':
         await handle_confirm_report(query, context, user_id, db_user)
@@ -1031,39 +1102,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ==================== MAIN ====================
-
-def main():
-    """Start the bot"""
-    try:
-        # Run startup
-        asyncio.run(startup())
-        
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        # Add error handler
-        application.add_error_handler(error_handler)
-        
-        # Add shutdown handler
-        application.post_shutdown = shutdown
-        
-        logger.info("🤖 Bot started successfully!")
-        logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
-        logger.info(f"Owner ID: {OWNER_ID}")
-        
-        # Start bot
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        asyncio.run(shutdown())
-        raise
+# ==================== MAIN ENTRY POINT ====================
 
 if __name__ == '__main__':
     main()
