@@ -3,6 +3,8 @@ import asyncio
 import sys
 import os
 import fcntl
+import time
+import signal
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
@@ -38,18 +40,44 @@ reporter = None
 application = None
 shutdown_event = asyncio.Event()
 lock_file = None
+lock_file_path = '/tmp/bot.lock'
 
 def acquire_lock():
     """Acquire a lock file to prevent multiple instances"""
     global lock_file
-    lock_path = '/tmp/bot.lock'
     try:
-        lock_file = open(lock_path, 'w')
+        # Check if lock file exists and is stale
+        if os.path.exists(lock_file_path):
+            try:
+                # Try to read the PID from the lock file
+                with open(lock_file_path, 'r') as f:
+                    old_pid = int(f.read().strip())
+                
+                # Check if process with that PID is still running
+                try:
+                    os.kill(old_pid, 0)  # Signal 0 just checks if process exists
+                    logger.error(f"❌ Another bot instance is already running with PID {old_pid}")
+                    return False
+                except OSError:
+                    # Process not running, lock is stale
+                    logger.info(f"Removing stale lock file from PID {old_pid}")
+                    os.remove(lock_file_path)
+            except (ValueError, IOError):
+                # Invalid lock file, remove it
+                try:
+                    os.remove(lock_file_path)
+                except:
+                    pass
+        
+        # Create new lock file
+        lock_file = open(lock_file_path, 'w')
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        logger.info("✅ Lock acquired, only one instance will run")
+        logger.info(f"✅ Lock acquired (PID: {os.getpid()})")
         return True
-    except (IOError, OSError):
-        logger.error("❌ Another bot instance is already running!")
+    except (IOError, OSError) as e:
+        logger.error(f"❌ Failed to acquire lock: {e}")
         return False
 
 def release_lock():
@@ -59,9 +87,17 @@ def release_lock():
         try:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
+            if os.path.exists(lock_file_path):
+                os.remove(lock_file_path)
             logger.info("✅ Lock released")
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error releasing lock: {e}")
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {sig}, initiating shutdown...")
+    if loop and loop.is_running():
+        loop.call_soon_threadsafe(shutdown_event.set)
 
 # ==================== COMMAND HANDLERS ====================
 
@@ -92,9 +128,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"last_active": get_utc_now()}
         )
         db_session.commit()
-        
-        # Refresh the user to get updated values
-        db_session.refresh(db_user)
         
     except Exception as e:
         logger.error(f"Start error: {e}")
@@ -165,9 +198,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"last_active": get_utc_now()}
         )
         db_session.commit()
-        
-        # Refresh the user
-        db_session.refresh(db_user)
         
     except Exception as e:
         logger.error(f"Database error: {e}")
@@ -1156,11 +1186,16 @@ async def async_main():
 
 def main():
     """Synchronous main entry point"""
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Try to acquire lock to prevent multiple instances
     if not acquire_lock():
         logger.error("Another bot instance is already running. Exiting.")
         sys.exit(1)
     
+    global loop
     loop = None
     try:
         # Handle Windows event loop policy
