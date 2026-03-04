@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import sys
+import os
+import fcntl
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from config import BOT_TOKEN, OWNER_ID, REPORT_CATEGORIES, REPORT_TEMPLATES, DEFAULT_TOKENS, REPORT_COST
@@ -35,6 +37,31 @@ account_manager = None
 reporter = None
 application = None
 shutdown_event = asyncio.Event()
+lock_file = None
+
+def acquire_lock():
+    """Acquire a lock file to prevent multiple instances"""
+    global lock_file
+    lock_path = '/tmp/bot.lock'
+    try:
+        lock_file = open(lock_path, 'w')
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("✅ Lock acquired, only one instance will run")
+        return True
+    except (IOError, OSError):
+        logger.error("❌ Another bot instance is already running!")
+        return False
+
+def release_lock():
+    """Release the lock file"""
+    global lock_file
+    if lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+            logger.info("✅ Lock released")
+        except:
+            pass
 
 # ==================== COMMAND HANDLERS ====================
 
@@ -44,6 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_session = db.get_session()
     
     try:
+        # Use a fresh session for each operation
         db_user = db_session.query(User).filter_by(user_id=user.id).first()
         
         if not db_user:
@@ -59,8 +87,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"New user registered: {user.id}")
             stats.increment('users_registered')
         
-        db_user.last_active = get_utc_now()
+        # Update last active - use update() to avoid detached instance issues
+        db_session.query(User).filter_by(user_id=user.id).update(
+            {"last_active": get_utc_now()}
+        )
         db_session.commit()
+        
+        # Refresh the user to get updated values
+        db_session.refresh(db_user)
         
     except Exception as e:
         logger.error(f"Start error: {e}")
@@ -70,23 +104,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db_session.close()
     
-    # Create menu
-    keyboard = [
-        [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
-        [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
-        [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
-        [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
-        [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
-    ]
-    
-    if db_user.role in ['owner', 'admin']:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
-    if db_user.role == 'owner':
-        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = f"""
+    # Get fresh user data for display
+    db_session = db.get_session()
+    try:
+        db_user = db_session.query(User).filter_by(user_id=user.id).first()
+        
+        # Create menu
+        keyboard = [
+            [InlineKeyboardButton("📊 My Stats", callback_data='stats')],
+            [InlineKeyboardButton("📝 Report", callback_data='report_menu')],
+            [InlineKeyboardButton("💰 Buy Tokens", callback_data='buy_tokens')],
+            [InlineKeyboardButton("👥 My Reports", callback_data='my_reports')],
+            [InlineKeyboardButton("📱 Add Account", callback_data='add_account')]
+        ]
+        
+        if db_user.role in ['owner', 'admin']:
+            keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
+        if db_user.role == 'owner':
+            keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data='owner_panel')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_text = f"""
 🌟 **Welcome {user.first_name}!** 🌟
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -100,7 +139,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Select an option below:
 """
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    finally:
+        db_session.close()
 
 # ==================== CALLBACK HANDLERS ====================
 
@@ -119,8 +160,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ User not found. Please use /start to register.")
             return
         
-        db_user.last_active = get_utc_now()
+        # Update last active using update() to avoid detached instance issues
+        db_session.query(User).filter_by(user_id=user_id).update(
+            {"last_active": get_utc_now()}
+        )
         db_session.commit()
+        
+        # Refresh the user
+        db_session.refresh(db_user)
         
     except Exception as e:
         logger.error(f"Database error: {e}")
@@ -1109,6 +1156,11 @@ async def async_main():
 
 def main():
     """Synchronous main entry point"""
+    # Try to acquire lock to prevent multiple instances
+    if not acquire_lock():
+        logger.error("Another bot instance is already running. Exiting.")
+        sys.exit(1)
+    
     loop = None
     try:
         # Handle Windows event loop policy
@@ -1130,6 +1182,9 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error in main: {e}")
     finally:
+        # Release lock
+        release_lock()
+        
         # Clean up loop
         if loop and not loop.is_closed():
             # Cancel all tasks
