@@ -743,7 +743,12 @@ async def handle_back_to_main(query, context, user_id):
 # ==================== MESSAGE HANDLERS ====================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
+    """Handle text messages - FIXED NoneType error"""
+    # Check if this is a valid message with text
+    if not update.message or not update.message.text:
+        logger.debug("Received update without text message, ignoring")
+        return
+    
     user_id = update.effective_user.id
     text = update.message.text
     db_session = db.get_session()
@@ -1130,8 +1135,16 @@ async def async_main():
         reporter = Reporter(account_manager)
         logger.info("✅ Reporter initialized")
         
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Create application with custom settings to avoid conflicts
+        builder = Application.builder().token(BOT_TOKEN)
+        
+        # Add custom connection settings
+        builder.connect_timeout(30)
+        builder.read_timeout(30)
+        builder.write_timeout(30)
+        builder.pool_timeout(30)
+        
+        application = builder.build()
         
         # Add handlers
         application.add_handler(CommandHandler("start", start))
@@ -1146,7 +1159,16 @@ async def async_main():
         # Initialize and start the application
         await application.initialize()
         await application.start()
-        await application.updater.start_polling()
+        
+        # Start polling with custom settings - FIXED conflict issue
+        await application.updater.start_polling(
+            poll_interval=1.0,
+            timeout=30,
+            read_latency=2.0,
+            bootstrap_retries=5,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True  # This clears any stuck updates
+        )
         
         # Wait for shutdown signal
         await shutdown_event.wait()
