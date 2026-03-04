@@ -93,6 +93,42 @@ class AccountManager:
             self.account_locks[phone] = asyncio.Lock()
         return self.account_locks[phone]
     
+    async def _cleanup_phone_sessions(self, phone_number):
+        """Completely clean up all traces of a phone number session"""
+        logger.info(f"Performing complete cleanup for {phone_number}")
+        
+        # Remove from active sessions
+        if phone_number in self.active_sessions:
+            try:
+                await self.active_sessions[phone_number]['client'].disconnect()
+            except:
+                pass
+            del self.active_sessions[phone_number]
+        
+        # Remove all session files for this phone
+        clean_phone = phone_number.replace('+', '').replace(' ', '')
+        
+        # Remove .session file
+        session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
+        if os.path.exists(session_file):
+            try:
+                os.remove(session_file)
+                logger.info(f"Removed session file: {session_file}")
+            except Exception as e:
+                logger.error(f"Error removing session file: {e}")
+        
+        # Remove .session-journal file (sometimes created by Telethon)
+        journal_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session-journal'
+        if os.path.exists(journal_file):
+            try:
+                os.remove(journal_file)
+                logger.info(f"Removed journal file: {journal_file}")
+            except Exception as e:
+                logger.error(f"Error removing journal file: {e}")
+        
+        # Wait a moment to ensure files are removed
+        await asyncio.sleep(1)
+    
     async def add_account(self, phone_number, verification_code=None, password=None):
         """Add a new Telegram account for reporting"""
         
@@ -125,6 +161,10 @@ class AccountManager:
             # Log the current step for debugging
             logger.info(f"Account addition step - Phone: {phone_number}, Code provided: {bool(verification_code)}, Password provided: {bool(password)}")
             
+            # If this is a new request (no code or password), do a thorough cleanup first
+            if verification_code is None and password is None:
+                await self._cleanup_phone_sessions(phone_number)
+            
             # Check if we have an existing session for this phone
             existing_session = self.active_sessions.get(phone_number)
             if existing_session:
@@ -133,11 +173,7 @@ class AccountManager:
                 # Check if session is too old (more than 3 minutes)
                 if time.time() - existing_session['created_at'] > 180:
                     logger.info(f"Existing session for {phone_number} expired, cleaning up")
-                    try:
-                        await existing_session['client'].disconnect()
-                    except:
-                        pass
-                    del self.active_sessions[phone_number]
+                    await self._cleanup_phone_sessions(phone_number)
                     existing_session = None
             
             # If we have an existing session and we're in the middle of authentication, reuse it
@@ -180,8 +216,7 @@ class AccountManager:
                     wait_time = e.seconds
                     logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
                     await client.disconnect()
-                    if phone_number in self.active_sessions:
-                        del self.active_sessions[phone_number]
+                    await self._cleanup_phone_sessions(phone_number)
                     return {
                         'status': 'flood_wait',
                         'wait_time': wait_time,
@@ -191,11 +226,13 @@ class AccountManager:
                 except PhoneNumberInvalidError:
                     logger.error(f"Invalid phone number: {phone_number}")
                     await client.disconnect()
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': 'Invalid phone number format'}
                     
                 except Exception as e:
                     logger.error(f"Error sending code: {e}")
                     await client.disconnect()
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': str(e)}
             
             # Step 2: Verify code
@@ -204,6 +241,7 @@ class AccountManager:
                 
                 if not session_data:
                     logger.error(f"No active session found for {phone_number}")
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 client = session_data['client']
@@ -216,12 +254,7 @@ class AccountManager:
                 if time.time() - created_at > 120:
                     logger.warning(f"Code expired for {phone_number}")
                     await client.disconnect()
-                    del self.active_sessions[phone_number]
-                    if os.path.exists(session_file):
-                        try:
-                            os.remove(session_file)
-                        except:
-                            pass
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'code_expired', 'message': 'Code expired'}
                 
                 try:
@@ -247,20 +280,18 @@ class AccountManager:
                 except PhoneCodeExpiredError:
                     logger.warning(f"Code expired for {phone_number}")
                     await client.disconnect()
-                    del self.active_sessions[phone_number]
-                    if os.path.exists(session_file):
-                        try:
-                            os.remove(session_file)
-                        except:
-                            pass
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'code_expired', 'message': 'Code expired'}
                     
                 except PhoneCodeInvalidError:
                     logger.warning(f"Invalid code for {phone_number}")
+                    # Don't clean up on invalid code, allow retry
                     return {'status': 'code_invalid', 'message': 'Invalid code'}
                     
                 except Exception as e:
                     logger.error(f"Code verification error: {e}")
+                    await client.disconnect()
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': str(e)}
             
             # Step 3: Enter password (2FA)
@@ -269,6 +300,7 @@ class AccountManager:
                 
                 if not session_data:
                     logger.error(f"No active session found for {phone_number} during password step")
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 client = session_data['client']
@@ -280,12 +312,7 @@ class AccountManager:
                 if time.time() - created_at > 180:
                     logger.warning(f"Password session expired for {phone_number}")
                     await client.disconnect()
-                    del self.active_sessions[phone_number]
-                    if os.path.exists(session_file):
-                        try:
-                            os.remove(session_file)
-                        except:
-                            pass
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 if not client.is_connected():
@@ -294,6 +321,7 @@ class AccountManager:
                         await client.connect()
                     except Exception as e:
                         logger.error(f"Reconnection failed: {e}")
+                        await self._cleanup_phone_sessions(phone_number)
                         return {'status': 'error', 'error': 'Connection lost'}
                 
                 try:
@@ -318,6 +346,7 @@ class AccountManager:
                     
                 except Exception as e:
                     logger.error(f"Password error: {e}")
+                    await self._cleanup_phone_sessions(phone_number)
                     return {'status': 'password_error', 'error': str(e)}
             
         except Exception as e:
@@ -327,6 +356,7 @@ class AccountManager:
                     await client.disconnect()
                 except:
                     pass
+            await self._cleanup_phone_sessions(phone_number)
             return {'status': 'error', 'error': str(e)}
     
     async def _save_authorized_client(self, client, phone_number, session_file):
@@ -361,18 +391,8 @@ class AccountManager:
             
             await client.disconnect()
             
-            # Remove from active sessions
-            if phone_number in self.active_sessions:
-                logger.info(f"Removing {phone_number} from active sessions")
-                del self.active_sessions[phone_number]
-            
-            # Remove session file
-            if os.path.exists(session_file):
-                try:
-                    os.remove(session_file)
-                    logger.info(f"Removed session file: {session_file}")
-                except:
-                    pass
+            # Do a thorough cleanup after successful save
+            await self._cleanup_phone_sessions(phone_number)
             
             return {
                 'status': 'success',
@@ -383,34 +403,16 @@ class AccountManager:
         except Exception as e:
             logger.error(f"Error saving account: {e}")
             await client.disconnect()
+            await self._cleanup_phone_sessions(phone_number)
             return {'status': 'error', 'error': f'Database error: {str(e)}'}
-    
-    async def _cancel_login(self, phone_number):
-        """Cancel login attempt"""
-        if phone_number in self.active_sessions:
-            logger.info(f"Cancelling login for {phone_number}")
-            try:
-                await self.active_sessions[phone_number]['client'].disconnect()
-            except:
-                pass
-            del self.active_sessions[phone_number]
-        
-        clean_phone = phone_number.replace('+', '').replace(' ', '')
-        session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
-        if os.path.exists(session_file):
-            try:
-                os.remove(session_file)
-                logger.info(f"Removed session file: {session_file}")
-            except:
-                pass
     
     async def resend_code(self, phone_number):
         """Resend verification code with complete cleanup"""
         try:
             logger.info(f"Resending code for {phone_number}")
             
-            # Cancel any existing login attempt
-            await self._cancel_login(phone_number)
+            # Do a thorough cleanup before resending
+            await self._cleanup_phone_sessions(phone_number)
             
             # Wait a bit to ensure cleanup
             await asyncio.sleep(3)
@@ -450,11 +452,14 @@ class AccountManager:
             
         except Exception as e:
             logger.error(f"Error resending code: {e}")
+            await self._cleanup_phone_sessions(phone_number)
             return {'status': 'error', 'error': str(e)}
     
     async def cancel_login(self, phone_number):
         """Cancel an ongoing login attempt"""
-        return await self._cancel_login(phone_number)
+        logger.info(f"Cancelling login for {phone_number}")
+        await self._cleanup_phone_sessions(phone_number)
+        return {'status': 'success'}
     
     async def get_available_accounts(self, limit=5):
         """Get available accounts for reporting"""
@@ -672,21 +677,7 @@ class AccountManager:
                         expired.append(phone)
                 
                 for phone in expired:
-                    logger.info(f"Cleaning up expired session for {phone}")
-                    try:
-                        await self.active_sessions[phone]['client'].disconnect()
-                    except:
-                        pass
-                    del self.active_sessions[phone]
-                    
-                    # Clean up session file
-                    clean_phone = phone.replace('+', '').replace(' ', '')
-                    session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
-                    if os.path.exists(session_file):
-                        try:
-                            os.remove(session_file)
-                        except:
-                            pass
+                    await self._cleanup_phone_sessions(phone)
                 
                 if expired:
                     logger.info(f"Cleaned up {len(expired)} expired sessions")
