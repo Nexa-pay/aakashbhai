@@ -360,18 +360,24 @@ class AccountManager:
             return {'status': 'error', 'error': str(e)}
     
     async def _save_authorized_client(self, client, phone_number, session_file):
-        """Save authorized client to database"""
+        """Save authorized client to database with session string"""
         try:
+            # Generate session string - THIS IS THE KEY PART
             session_string = StringSession.save(client.session)
-            db_session = self.db.get_session()
+            logger.info(f"✅ Generated session string for {phone_number}")
+            logger.info(f"Session string length: {len(session_string)} characters")
+            logger.info(f"Session string preview: {session_string[:50]}...")
             
+            db_session = self.db.get_session()
             try:
+                # Check if account already exists
                 existing = db_session.query(TelegramAccount).filter_by(phone_number=phone_number).first()
                 
                 if existing:
                     existing.session_string = session_string
                     existing.is_active = True
                     existing.status = 'available'
+                    existing.added_date = datetime.now(timezone.utc)
                     logger.info(f"Updated existing account: {phone_number}")
                 else:
                     account = TelegramAccount(
@@ -386,6 +392,22 @@ class AccountManager:
                 db_session.commit()
                 logger.info(f"✅ Account saved to database: {phone_number}")
                 
+                # Verify it was saved
+                saved = db_session.query(TelegramAccount).filter_by(phone_number=phone_number).first()
+                if saved and saved.session_string:
+                    logger.info(f"✅ Verified: Session string exists in DB for {phone_number}")
+                    logger.info(f"Stored session string length: {len(saved.session_string)}")
+                else:
+                    logger.error(f"❌ Verification failed: Session string not found in DB for {phone_number}")
+                
+                # Count total accounts
+                count = db_session.query(TelegramAccount).count()
+                logger.info(f"Total accounts in DB: {count}")
+                
+            except Exception as e:
+                logger.error(f"Database error: {e}")
+                db_session.rollback()
+                raise
             finally:
                 db_session.close()
             
@@ -397,7 +419,7 @@ class AccountManager:
             return {
                 'status': 'success',
                 'phone': phone_number,
-                'message': 'Account added successfully!'
+                'message': '✅ Account added successfully!'
             }
             
         except Exception as e:
@@ -471,7 +493,11 @@ class AccountManager:
                 TelegramAccount.status == 'available',
                 (TelegramAccount.cooldown_until.is_(None) | (TelegramAccount.cooldown_until <= now))
             ).limit(limit).all()
+            
             logger.info(f"Found {len(accounts)} available accounts")
+            for acc in accounts:
+                logger.info(f"Account {acc.phone_number} - Session string length: {len(acc.session_string) if acc.session_string else 0}")
+            
             return accounts
         finally:
             db_session.close()
@@ -484,6 +510,11 @@ class AccountManager:
                 return {'status': 'failed', 'reason': 'No target'}
             
             logger.info(f"Reporting {target_username} with account {account.phone_number}")
+            
+            # Use the saved session string
+            if not account.session_string:
+                logger.error(f"Account {account.phone_number} has no session string!")
+                return {'status': 'failed', 'reason': 'no_session'}
             
             client = TelegramClient(
                 StringSession(account.session_string), 
@@ -698,6 +729,9 @@ class AccountManager:
             if not account:
                 return {'status': 'error', 'reason': 'account_not_found'}
             
+            if not account.session_string:
+                return {'status': 'error', 'reason': 'no_session_string'}
+            
             client = TelegramClient(StringSession(account.session_string), API_ID, API_HASH)
             await client.connect()
             
@@ -739,12 +773,16 @@ class AccountManager:
             total = db_session.query(TelegramAccount).count()
             active = db_session.query(TelegramAccount).filter_by(is_active=True).count()
             available = db_session.query(TelegramAccount).filter_by(status='available', is_active=True).count()
+            with_session = db_session.query(TelegramAccount).filter(TelegramAccount.session_string.isnot(None)).count()
             banned = db_session.query(TelegramAccount).filter_by(is_active=False).count()
+            
+            logger.info(f"DB Stats - Total: {total}, Active: {active}, With Session: {with_session}")
             
             return {
                 'total': total,
                 'active': active,
                 'available': available,
+                'with_session': with_session,
                 'banned': banned
             }
         except Exception as e:
@@ -753,6 +791,7 @@ class AccountManager:
                 'total': 0,
                 'active': 0,
                 'available': 0,
+                'with_session': 0,
                 'banned': 0
             }
         finally:
