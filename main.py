@@ -34,77 +34,7 @@ db = None
 account_manager = None
 reporter = None
 application = None
-
-async def async_main():
-    """Async main function"""
-    global db, account_manager, reporter, application
-    
-    try:
-        # Initialize database
-        from config import DATABASE_URL
-        db = init_db(DATABASE_URL)
-        logger.info("✅ Database initialized")
-        
-        # Initialize account manager
-        account_manager = AccountManager()
-        await account_manager.start()
-        logger.info("✅ Account manager started")
-        
-        # Initialize reporter
-        reporter = Reporter(account_manager)
-        logger.info("✅ Reporter initialized")
-        
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_error_handler(error_handler)
-        
-        logger.info("🤖 Bot started successfully!")
-        logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
-        logger.info(f"Owner ID: {OWNER_ID}")
-        
-        # Start polling (this blocks until stopped)
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
-    finally:
-        # Cleanup
-        if account_manager:
-            await account_manager.stop()
-        if db:
-            db.close_session()
-        logger.info("✅ Shutdown complete")
-
-def main():
-    """Synchronous main entry point"""
-    try:
-        # Create and set event loop
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Run the async main function
-        loop.run_until_complete(async_main())
-        
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-    finally:
-        # Clean up loop
-        try:
-            loop.stop()
-            loop.close()
-        except:
-            pass
+shutdown_event = asyncio.Event()
 
 # ==================== COMMAND HANDLERS ====================
 
@@ -1102,7 +1032,120 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ==================== MAIN ENTRY POINT ====================
+# ==================== MAIN FUNCTIONS ====================
+
+async def async_main():
+    """Async main function"""
+    global db, account_manager, reporter, application
+    
+    try:
+        # Initialize database
+        from config import DATABASE_URL
+        db = init_db(DATABASE_URL)
+        logger.info("✅ Database initialized")
+        
+        # Initialize account manager
+        account_manager = AccountManager()
+        await account_manager.start()
+        logger.info("✅ Account manager started")
+        
+        # Initialize reporter
+        reporter = Reporter(account_manager)
+        logger.info("✅ Reporter initialized")
+        
+        # Create application
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CallbackQueryHandler(button_handler))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_error_handler(error_handler)
+        
+        logger.info("🤖 Bot started successfully!")
+        logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
+        logger.info(f"Owner ID: {OWNER_ID}")
+        
+        # Initialize and start the application
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+            
+    except Exception as e:
+        logger.error(f"Fatal error in async_main: {e}")
+        raise
+    finally:
+        # Cleanup
+        logger.info("Starting shutdown...")
+        
+        # Stop application
+        if application:
+            try:
+                if application.updater:
+                    await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+            except Exception as e:
+                logger.error(f"Error stopping application: {e}")
+        
+        # Stop account manager
+        if account_manager:
+            try:
+                await account_manager.stop()
+            except Exception as e:
+                logger.error(f"Error stopping account manager: {e}")
+        
+        # Close database
+        if db:
+            try:
+                db.close_session()
+            except Exception as e:
+                logger.error(f"Error closing database: {e}")
+        
+        logger.info("✅ Shutdown complete")
+
+def main():
+    """Synchronous main entry point"""
+    loop = None
+    try:
+        # Handle Windows event loop policy
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the async main function
+        loop.run_until_complete(async_main())
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        # Signal shutdown
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(shutdown_event.set)
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+    finally:
+        # Clean up loop
+        if loop and not loop.is_closed():
+            # Cancel all tasks
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+            
+            # Run loop one last time to let tasks finish
+            if not loop.is_running():
+                try:
+                    loop.run_until_complete(asyncio.sleep(0.1))
+                except:
+                    pass
+            
+            # Close loop
+            loop.close()
+            logger.info("✅ Event loop closed")
 
 if __name__ == '__main__':
     main()
