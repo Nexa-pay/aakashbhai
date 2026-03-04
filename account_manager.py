@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class AccountManager:
     def __init__(self):
         self.db = get_db()
-        self.active_sessions = {}  # phone -> {client, phone_code_hash, created_at}
+        self.active_sessions = {}  # phone -> {client, phone_code_hash, created_at, step}
         self.account_locks = {}  # phone -> asyncio.Lock
         self.report_queue = asyncio.Queue()
         self.is_running = False
@@ -122,22 +122,37 @@ class AccountManager:
             session_path = os.path.join(SESSIONS_DIR, clean_phone)
             session_file = session_path + '.session'
             
-            # Clean up old session
-            if os.path.exists(session_file):
-                try:
-                    os.remove(session_file)
-                    logger.info(f"Removed old session file for {phone_number}")
-                except:
-                    pass
+            # Log the current step for debugging
+            logger.info(f"Account addition step - Phone: {phone_number}, Code provided: {bool(verification_code)}, Password provided: {bool(password)}")
             
-            await self._cancel_login(phone_number)
+            # Check if we have an existing session for this phone
+            existing_session = self.active_sessions.get(phone_number)
+            if existing_session:
+                logger.info(f"Found existing session for {phone_number} created at {datetime.fromtimestamp(existing_session['created_at']).isoformat()}")
+                
+                # Check if session is too old (more than 3 minutes)
+                if time.time() - existing_session['created_at'] > 180:
+                    logger.info(f"Existing session for {phone_number} expired, cleaning up")
+                    try:
+                        await existing_session['client'].disconnect()
+                    except:
+                        pass
+                    del self.active_sessions[phone_number]
+                    existing_session = None
             
-            # Create new client
-            client = TelegramClient(session_path, API_ID, API_HASH)
-            await client.connect()
+            # If we have an existing session and we're in the middle of authentication, reuse it
+            if existing_session and (verification_code or password):
+                client = existing_session['client']
+                logger.info(f"Reusing existing session for {phone_number}")
+            else:
+                # Create new client
+                client = TelegramClient(session_path, API_ID, API_HASH)
+                await client.connect()
+                logger.info(f"Created new client for {phone_number}")
             
             # Check if already authorized
             if await client.is_user_authorized():
+                logger.info(f"Client for {phone_number} is already authorized")
                 return await self._save_authorized_client(client, phone_number, session_file)
             
             # Step 1: Send code
@@ -149,8 +164,11 @@ class AccountManager:
                     self.active_sessions[phone_number] = {
                         'client': client,
                         'phone_code_hash': result.phone_code_hash,
-                        'created_at': time.time()
+                        'created_at': time.time(),
+                        'step': 'code_sent'
                     }
+                    
+                    logger.info(f"Code sent successfully to {phone_number}, hash: {result.phone_code_hash[:10]}...")
                     
                     return {
                         'status': 'code_sent',
@@ -162,6 +180,8 @@ class AccountManager:
                     wait_time = e.seconds
                     logger.warning(f"Flood wait for {phone_number}: {wait_time} seconds")
                     await client.disconnect()
+                    if phone_number in self.active_sessions:
+                        del self.active_sessions[phone_number]
                     return {
                         'status': 'flood_wait',
                         'wait_time': wait_time,
@@ -169,12 +189,13 @@ class AccountManager:
                     }
                     
                 except PhoneNumberInvalidError:
+                    logger.error(f"Invalid phone number: {phone_number}")
                     await client.disconnect()
                     return {'status': 'error', 'error': 'Invalid phone number format'}
                     
                 except Exception as e:
-                    await client.disconnect()
                     logger.error(f"Error sending code: {e}")
+                    await client.disconnect()
                     return {'status': 'error', 'error': str(e)}
             
             # Step 2: Verify code
@@ -182,15 +203,20 @@ class AccountManager:
                 session_data = self.active_sessions.get(phone_number)
                 
                 if not session_data:
+                    logger.error(f"No active session found for {phone_number}")
                     return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 client = session_data['client']
                 phone_code_hash = session_data['phone_code_hash']
                 created_at = session_data['created_at']
                 
+                logger.info(f"Session age: {time.time() - created_at:.1f} seconds")
+                
+                # Check if code expired (2 minutes)
                 if time.time() - created_at > 120:
+                    logger.warning(f"Code expired for {phone_number}")
                     await client.disconnect()
-                    self.active_sessions.pop(phone_number, None)
+                    del self.active_sessions[phone_number]
                     if os.path.exists(session_file):
                         try:
                             os.remove(session_file)
@@ -206,11 +232,13 @@ class AccountManager:
                         phone_code_hash=phone_code_hash
                     )
                     
+                    logger.info(f"Code sign in successful for {phone_number}")
                     return await self._save_authorized_client(client, phone_number, session_file)
                     
                 except SessionPasswordNeededError:
                     logger.info(f"2FA required for {phone_number}")
-                    session_data['created_at'] = time.time()
+                    session_data['created_at'] = time.time()  # Reset timer for password step
+                    session_data['step'] = 'password_needed'
                     return {
                         'status': 'password_needed',
                         'message': '2FA enabled. Please enter your password.'
@@ -219,7 +247,7 @@ class AccountManager:
                 except PhoneCodeExpiredError:
                     logger.warning(f"Code expired for {phone_number}")
                     await client.disconnect()
-                    self.active_sessions.pop(phone_number, None)
+                    del self.active_sessions[phone_number]
                     if os.path.exists(session_file):
                         try:
                             os.remove(session_file)
@@ -240,19 +268,39 @@ class AccountManager:
                 session_data = self.active_sessions.get(phone_number)
                 
                 if not session_data:
-                    return {'status': 'error', 'error': 'Session expired'}
+                    logger.error(f"No active session found for {phone_number} during password step")
+                    return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 client = session_data['client']
+                created_at = session_data['created_at']
+                
+                logger.info(f"Password step - Session age: {time.time() - created_at:.1f} seconds")
+                
+                # Check if session expired (3 minutes total)
+                if time.time() - created_at > 180:
+                    logger.warning(f"Password session expired for {phone_number}")
+                    await client.disconnect()
+                    del self.active_sessions[phone_number]
+                    if os.path.exists(session_file):
+                        try:
+                            os.remove(session_file)
+                        except:
+                            pass
+                    return {'status': 'error', 'error': 'Session expired. Please start over.'}
                 
                 if not client.is_connected():
+                    logger.info(f"Client disconnected, reconnecting for {phone_number}")
                     try:
                         await client.connect()
-                    except:
+                    except Exception as e:
+                        logger.error(f"Reconnection failed: {e}")
                         return {'status': 'error', 'error': 'Connection lost'}
                 
                 try:
                     logger.info(f"Attempting to sign in {phone_number} with password")
                     await client.sign_in(password=password)
+                    
+                    logger.info(f"Password sign in successful for {phone_number}")
                     return await self._save_authorized_client(client, phone_number, session_file)
                     
                 except PasswordHashInvalidError:
@@ -294,6 +342,7 @@ class AccountManager:
                     existing.session_string = session_string
                     existing.is_active = True
                     existing.status = 'available'
+                    logger.info(f"Updated existing account: {phone_number}")
                 else:
                     account = TelegramAccount(
                         phone_number=phone_number,
@@ -302,19 +351,26 @@ class AccountManager:
                         status='available'
                     )
                     db_session.add(account)
+                    logger.info(f"Created new account: {phone_number}")
                 
                 db_session.commit()
-                logger.info(f"✅ Account added: {phone_number}")
+                logger.info(f"✅ Account saved to database: {phone_number}")
                 
             finally:
                 db_session.close()
             
             await client.disconnect()
-            self.active_sessions.pop(phone_number, None)
             
+            # Remove from active sessions
+            if phone_number in self.active_sessions:
+                logger.info(f"Removing {phone_number} from active sessions")
+                del self.active_sessions[phone_number]
+            
+            # Remove session file
             if os.path.exists(session_file):
                 try:
                     os.remove(session_file)
+                    logger.info(f"Removed session file: {session_file}")
                 except:
                     pass
             
@@ -332,23 +388,27 @@ class AccountManager:
     async def _cancel_login(self, phone_number):
         """Cancel login attempt"""
         if phone_number in self.active_sessions:
+            logger.info(f"Cancelling login for {phone_number}")
             try:
                 await self.active_sessions[phone_number]['client'].disconnect()
             except:
                 pass
-            self.active_sessions.pop(phone_number, None)
+            del self.active_sessions[phone_number]
         
         clean_phone = phone_number.replace('+', '').replace(' ', '')
         session_file = os.path.join(SESSIONS_DIR, clean_phone) + '.session'
         if os.path.exists(session_file):
             try:
                 os.remove(session_file)
+                logger.info(f"Removed session file: {session_file}")
             except:
                 pass
     
     async def resend_code(self, phone_number):
         """Resend verification code with complete cleanup"""
         try:
+            logger.info(f"Resending code for {phone_number}")
+            
             # Cancel any existing login attempt
             await self._cancel_login(phone_number)
             
@@ -363,15 +423,15 @@ class AccountManager:
             
             # Send new code
             result = await client.send_code_request(phone_number)
+            logger.info(f"New code sent to {phone_number}, hash: {result.phone_code_hash[:10]}...")
             
             # Store in active sessions
             self.active_sessions[phone_number] = {
                 'client': client,
                 'phone_code_hash': result.phone_code_hash,
-                'created_at': time.time()
+                'created_at': time.time(),
+                'step': 'code_sent'
             }
-            
-            logger.info(f"New code sent to {phone_number}")
             
             return {
                 'status': 'code_sent',
@@ -406,6 +466,7 @@ class AccountManager:
                 TelegramAccount.status == 'available',
                 (TelegramAccount.cooldown_until.is_(None) | (TelegramAccount.cooldown_until <= now))
             ).limit(limit).all()
+            logger.info(f"Found {len(accounts)} available accounts")
             return accounts
         finally:
             db_session.close()
@@ -417,6 +478,8 @@ class AccountManager:
             if not target_username:
                 return {'status': 'failed', 'reason': 'No target'}
             
+            logger.info(f"Reporting {target_username} with account {account.phone_number}")
+            
             client = TelegramClient(
                 StringSession(account.session_string), 
                 API_ID, 
@@ -425,6 +488,7 @@ class AccountManager:
             await client.connect()
             
             if not await client.is_user_authorized():
+                logger.warning(f"Account {account.phone_number} not authorized")
                 account.is_active = False
                 db_session = self.db.get_session()
                 try:
@@ -441,7 +505,7 @@ class AccountManager:
             
             try:
                 entity = await client.get_entity(target_username)
-                logger.info(f"Found entity for reporting: {getattr(entity, 'title', getattr(entity, 'username', 'Unknown'))}")
+                logger.info(f"Found entity: {getattr(entity, 'title', getattr(entity, 'username', 'Unknown'))}")
             except ValueError:
                 try:
                     entity = await client.get_entity(int(target_username))
@@ -503,11 +567,13 @@ class AccountManager:
                     account.reports_count += 1
                     db_session.add(account)
                     db_session.commit()
+                    logger.info(f"Account {account.phone_number} updated with cooldown")
                 finally:
                     db_session.close()
                 
                 return {'status': 'success'}
             else:
+                logger.warning(f"All report methods failed for {original_target}")
                 return {'status': 'failed', 'reason': 'all_methods_failed'}
             
         except Exception as e:
@@ -594,13 +660,15 @@ class AccountManager:
         logger.info("Session cleanup task started")
         while self.is_running:
             try:
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(30)  # Check every 30 seconds
                 
                 now = time.time()
                 expired = []
                 
                 for phone, session_data in self.active_sessions.items():
-                    if now - session_data.get('created_at', 0) > 180:  # 3 minutes
+                    session_age = now - session_data.get('created_at', 0)
+                    if session_age > 180:  # 3 minutes
+                        logger.info(f"Session for {phone} expired after {session_age:.1f} seconds")
                         expired.append(phone)
                 
                 for phone in expired:
