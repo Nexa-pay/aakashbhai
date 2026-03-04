@@ -25,6 +25,7 @@ from utils import (
     get_utc_now
 )
 from datetime import datetime, timezone
+from sqlalchemy import text
 
 # Enable logging
 logging.basicConfig(
@@ -176,6 +177,99 @@ Select an option below:
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
     finally:
         db_session.close()
+
+# ==================== TEST COMMANDS ====================
+
+async def test_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test database connection and insertion"""
+    user = update.effective_user
+    
+    # Check if user is owner
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only command!")
+        return
+    
+    await update.message.reply_text("🔄 Testing database connection...")
+    
+    try:
+        # Test 1: Simple query
+        db_session = db.get_session()
+        try:
+            result = db_session.execute(text("SELECT 1")).scalar()
+            if result == 1:
+                await update.message.reply_text("✅ Database connection test passed!")
+            else:
+                await update.message.reply_text("❌ Database connection test failed!")
+                return
+        finally:
+            db_session.close()
+        
+        # Test 2: Check accounts table
+        db_session = db.get_session()
+        try:
+            count = db_session.query(TelegramAccount).count()
+            await update.message.reply_text(
+                f"📊 **Database Stats**\n\n"
+                f"Total accounts in database: `{count}`\n\n"
+                f"Your PostgreSQL table 'telegram_accounts' is ready!"
+            )
+        finally:
+            db_session.close()
+            
+    except Exception as e:
+        await update.message.reply_text(f"❌ Test failed: {e}")
+
+async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all added Telegram accounts"""
+    user = update.effective_user
+    
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only command!")
+        return
+    
+    db_session = db.get_session()
+    try:
+        accounts = db_session.query(TelegramAccount).all()
+        
+        if not accounts:
+            await update.message.reply_text("📭 No accounts added yet.")
+            return
+        
+        text = "📱 **Added Accounts:**\n\n"
+        for acc in accounts:
+            status = "✅ Active" if acc.is_active else "❌ Inactive"
+            session_status = "🔑 Has session" if acc.session_string else "❌ No session"
+            text += f"• `{acc.phone_number}` - {status} - {session_status}\n"
+            text += f"  Session length: {len(acc.session_string) if acc.session_string else 0} chars\n"
+        
+        await update.message.reply_text(text, parse_mode='Markdown')
+        
+    finally:
+        db_session.close()
+
+async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test Telegram API connection"""
+    user = update.effective_user
+    
+    if user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Owner only!")
+        return
+    
+    await update.message.reply_text("🔍 Testing Telegram API...")
+    
+    try:
+        from telethon import TelegramClient
+        from config import API_ID, API_HASH
+        
+        # Just test connection
+        client = TelegramClient('test_session', API_ID, API_HASH)
+        await client.connect()
+        await client.disconnect()
+        
+        await update.message.reply_text("✅ API credentials work!")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ API Error: {e}")
 
 # ==================== CALLBACK HANDLERS ====================
 
@@ -810,6 +904,9 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(f"❌ {error}")
         return
     
+    # Cancel any existing login for this phone
+    await account_manager.cancel_login(phone)
+    
     context.user_data['phone'] = phone
     context.user_data['awaiting_phone'] = False
     context.user_data['awaiting_code'] = True
@@ -823,13 +920,15 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "📱 **Verification Code Sent!**\n\n"
             "Please enter the 5-digit code you received:\n"
             "**Example:** `12345`\n\n"
-            "⏰ **Note:** Code expires in 2 minutes."
+            "⏰ **Note:** Code expires in 2 minutes.\n\n"
+            "⚠️ **IMPORTANT:** Enter the code immediately when you receive it!"
         )
     elif result['status'] == 'flood_wait':
         wait_time = result.get('wait_time', 60)
         await update.message.reply_text(
             f"⏳ **Too Many Attempts**\n\n"
-            f"Please wait {wait_time} seconds before trying again."
+            f"Please wait {wait_time} seconds before trying again.\n"
+            f"Your phone number: `{phone}`"
         )
         context.user_data.clear()
     else:
@@ -1142,6 +1241,9 @@ async def async_main():
         
         # Add handlers
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("testdb", test_db))
+        application.add_handler(CommandHandler("accounts", list_accounts))
+        application.add_handler(CommandHandler("testapi", test_api))
         application.add_handler(CallbackQueryHandler(button_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
@@ -1154,7 +1256,7 @@ async def async_main():
         await application.initialize()
         await application.start()
         
-        # Start polling with standard parameters - FIXED: removed invalid parameter
+        # Start polling with standard parameters
         await application.updater.start_polling(
             poll_interval=1.0,
             timeout=30,
